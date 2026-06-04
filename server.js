@@ -38,6 +38,10 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 const PAGE_LIMIT = 100;
+const RESOLVE_CHUNK_CONCURRENCY = Number.parseInt(
+  process.env.RESOLVE_CHUNK_CONCURRENCY || "50",
+  10
+);
 
 function getRequiredEnv(name, env = process.env) {
   const value = env[name];
@@ -529,7 +533,49 @@ function getResolvePlan(columns, rootResolveRules = []) {
       }
     }
   }
-  return Array.from(planMap.values()).sort((a, b) => a.path.split(".").length - b.path.split(".").length);
+  return Array.from(planMap.values()).sort(
+    (a, b) => getResolvePathDepth(a.path) - getResolvePathDepth(b.path)
+  );
+}
+
+function getResolvePathDepth(pathValue) {
+  return String(pathValue || "")
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter(Boolean).length;
+}
+
+function groupResolvePlanByDepth(resolvePlan) {
+  const groups = new Map();
+  for (const rule of resolvePlan) {
+    const depth = getResolvePathDepth(rule.path);
+    if (!groups.has(depth)) {
+      groups.set(depth, []);
+    }
+    groups.get(depth).push(rule);
+  }
+  return Array.from(groups.entries())
+    .sort((left, right) => left[0] - right[0])
+    .map(([, rules]) => rules);
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  if (items.length === 0) return [];
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
 }
 
 function chunkArray(values, size) {
@@ -542,104 +588,123 @@ function chunkArray(values, size) {
 
 async function batchFetchByIds({ baseUrl, token, dataType, ids, subrequestHistory, rulePath }) {
   const chunks = chunkArray(ids, 100);
-  const fetched = [];
-  for (let i = 0; i < chunks.length; i += 1) {
-    const idChunk = chunks[i];
-    const constraints = [{ key: "_id", constraint_type: "in", value: idChunk }];
-    const results = await fetchAllRecords({
-      baseUrl,
-      token,
-      dataType,
-      constraints,
-      maxRecords: undefined,
-      subrequestHistory,
-      historyContext: {
-        step: "resolve-batch",
-        path: `${rulePath} [chunk ${i + 1}/${chunks.length}]`,
-      },
-    });
-    fetched.push(...results);
+  const chunkResults = await runWithConcurrency(
+    chunks,
+    RESOLVE_CHUNK_CONCURRENCY,
+    async (idChunk, chunkIndex) => {
+      const constraints = [{ key: "_id", constraint_type: "in", value: idChunk }];
+      return fetchAllRecords({
+        baseUrl,
+        token,
+        dataType,
+        constraints,
+        maxRecords: undefined,
+        subrequestHistory,
+        historyContext: {
+          step: "resolve-batch",
+          path: `${rulePath} [chunk ${chunkIndex + 1}/${chunks.length}]`,
+        },
+      });
+    }
+  );
+  return chunkResults.flat();
+}
+
+async function applyResolveRule(records, rule, context) {
+  const ruleStartedAt = Date.now();
+  const missingIds = new Set();
+  let cacheHits = 0;
+
+  for (const record of records) {
+    const currentValue = readByPath(record, rule.path);
+    if (currentValue === undefined || currentValue === null) continue;
+    const valueList = Array.isArray(currentValue) ? currentValue : [currentValue];
+    for (const item of valueList) {
+      const refId = extractThingId(item);
+      if (!refId) continue;
+      const cacheKey = `${rule.type}::${refId}`;
+      if (!context.resolveCache.has(cacheKey)) {
+        missingIds.add(refId);
+      } else {
+        cacheHits += 1;
+      }
+    }
   }
-  return fetched;
+
+  context.metrics.cacheHits += cacheHits;
+
+  if (missingIds.size > 0) {
+    console.log(`${context.logPrefix} Resolving references in batch`, {
+      path: rule.path,
+      type: rule.type,
+      apiType: rule.apiType,
+      ids: missingIds.size,
+      chunks: Math.ceil(missingIds.size / 100),
+      chunkConcurrency: RESOLVE_CHUNK_CONCURRENCY,
+    });
+
+    let fetchedThings;
+    try {
+      fetchedThings = await batchFetchByIds({
+        baseUrl: context.baseUrl,
+        token: context.token,
+        dataType: rule.apiType,
+        ids: Array.from(missingIds),
+        subrequestHistory: context.subrequestHistory,
+        rulePath: rule.path,
+      });
+    } catch (error) {
+      if (String(error.message).includes("Type not found")) {
+        throw new Error(
+          `${error.message}. For display names use resolve.api_type with real Data API type slug (rule path "${rule.path}").`
+        );
+      }
+      throw error;
+    }
+
+    for (const thing of fetchedThings) {
+      const thingId = extractThingId(thing);
+      if (!thingId) continue;
+      const cacheKey = `${rule.type}::${thingId}`;
+      context.resolveCache.set(cacheKey, thing);
+    }
+  }
+
+  for (const record of records) {
+    const currentValue = readByPath(record, rule.path);
+    if (currentValue === undefined || currentValue === null) continue;
+    const valueList = Array.isArray(currentValue) ? currentValue : [currentValue];
+    const resolvedList = valueList.map((item) => {
+      const refId = extractThingId(item);
+      if (!refId) return item;
+      const cacheKey = `${rule.type}::${refId}`;
+      return context.resolveCache.get(cacheKey) || item;
+    });
+    setByPath(record, rule.path, Array.isArray(currentValue) ? resolvedList : resolvedList[0] ?? null);
+  }
+
+  console.log(`${context.logPrefix} Resolve rule complete`, {
+    path: rule.path,
+    type: rule.type,
+    apiType: rule.apiType,
+    cacheHits,
+    fetchedIds: missingIds.size,
+    durationMs: Date.now() - ruleStartedAt,
+  });
 }
 
 async function applyResolvePlan(records, resolvePlan, context) {
-  for (const rule of resolvePlan) {
-    const missingIds = new Set();
-
-    for (const record of records) {
-      const currentValue = readByPath(record, rule.path);
-      if (currentValue === undefined || currentValue === null) continue;
-      const valueList = Array.isArray(currentValue) ? currentValue : [currentValue];
-      for (const item of valueList) {
-        const refId = extractThingId(item);
-        if (!refId) continue;
-        const cacheKey = `${rule.type}::${refId}`;
-        if (!context.resolveCache.has(cacheKey)) {
-          missingIds.add(refId);
-        } else if (Array.isArray(context.subrequestHistory)) {
-          context.subrequestHistory.push({
-            step: "resolve-batch",
-            type: rule.apiType,
-            path: `${rule.path} [cache]`,
-            cursor: null,
-            limit: null,
-            status: "CACHE",
-            durationMs: 0,
-            resultCount: 1,
-            cache: "hit",
-          });
-        }
-      }
-    }
-
-    if (missingIds.size > 0) {
-      console.log(`${context.logPrefix} Resolving references in batch`, {
-        path: rule.path,
-        type: rule.type,
-        apiType: rule.apiType,
-        ids: missingIds.size,
-      });
-
-      let fetchedThings;
-      try {
-        fetchedThings = await batchFetchByIds({
-          baseUrl: context.baseUrl,
-          token: context.token,
-          dataType: rule.apiType,
-          ids: Array.from(missingIds),
-          subrequestHistory: context.subrequestHistory,
-          rulePath: rule.path,
-        });
-      } catch (error) {
-        if (String(error.message).includes("Type not found")) {
-          throw new Error(
-            `${error.message}. For display names use resolve.api_type with real Data API type slug (rule path "${rule.path}").`
-          );
-        }
-        throw error;
-      }
-
-      for (const thing of fetchedThings) {
-        const thingId = extractThingId(thing);
-        if (!thingId) continue;
-        const cacheKey = `${rule.type}::${thingId}`;
-        context.resolveCache.set(cacheKey, thing);
-      }
-    }
-
-    for (const record of records) {
-      const currentValue = readByPath(record, rule.path);
-      if (currentValue === undefined || currentValue === null) continue;
-      const valueList = Array.isArray(currentValue) ? currentValue : [currentValue];
-      const resolvedList = valueList.map((item) => {
-        const refId = extractThingId(item);
-        if (!refId) return item;
-        const cacheKey = `${rule.type}::${refId}`;
-        return context.resolveCache.get(cacheKey) || item;
-      });
-      setByPath(record, rule.path, Array.isArray(currentValue) ? resolvedList : resolvedList[0] ?? null);
-    }
+  const depthGroups = groupResolvePlanByDepth(resolvePlan);
+  for (const rulesAtDepth of depthGroups) {
+    const depth = getResolvePathDepth(rulesAtDepth[0].path);
+    const depthStartedAt = Date.now();
+    await Promise.all(rulesAtDepth.map((rule) => applyResolveRule(records, rule, context)));
+    console.log(`${context.logPrefix} Resolve depth complete`, {
+      depth,
+      rules: rulesAtDepth.length,
+      paths: rulesAtDepth.map((rule) => rule.path),
+      durationMs: Date.now() - depthStartedAt,
+    });
   }
 }
 
@@ -688,10 +753,96 @@ async function fetchAllRecords({
   return allResults;
 }
 
-function printSubrequestHistory(logPrefix, subrequestHistory) {
-  if (!Array.isArray(subrequestHistory) || subrequestHistory.length === 0) return;
-  console.log(`${logPrefix} Subrequest history table`);
-  console.table(subrequestHistory);
+function createEmptyPhaseStats() {
+  return { requests: 0, apiDurationMs: 0, results: 0, errors: 0 };
+}
+
+function buildPerformanceSummary(subrequestHistory, metrics = {}) {
+  const summary = {
+    cacheHits: metrics.cacheHits || 0,
+    phases: {
+      list: createEmptyPhaseStats(),
+      "resolve-batch": createEmptyPhaseStats(),
+    },
+    byApiType: {},
+    total: createEmptyPhaseStats(),
+  };
+
+  for (const entry of subrequestHistory || []) {
+    const step = entry.step === "resolve-batch" ? "resolve-batch" : "list";
+    const phase = summary.phases[step];
+    phase.requests += 1;
+    phase.apiDurationMs += entry.durationMs || 0;
+    phase.results += entry.resultCount || 0;
+    if (typeof entry.status === "number" && entry.status >= 400) {
+      phase.errors += 1;
+    }
+
+    const apiType = entry.type || "unknown";
+    if (!summary.byApiType[apiType]) {
+      summary.byApiType[apiType] = createEmptyPhaseStats();
+    }
+    const typeStats = summary.byApiType[apiType];
+    typeStats.requests += 1;
+    typeStats.apiDurationMs += entry.durationMs || 0;
+    typeStats.results += entry.resultCount || 0;
+    if (typeof entry.status === "number" && entry.status >= 400) {
+      typeStats.errors += 1;
+    }
+
+    summary.total.requests += 1;
+    summary.total.apiDurationMs += entry.durationMs || 0;
+    summary.total.results += entry.resultCount || 0;
+    if (typeof entry.status === "number" && entry.status >= 400) {
+      summary.total.errors += 1;
+    }
+  }
+
+  return summary;
+}
+
+function printExportPerformanceSummary(logPrefix, subrequestHistory, wallClock, metrics = {}) {
+  const summary = buildPerformanceSummary(subrequestHistory, metrics);
+  const resolvePhase = summary.phases["resolve-batch"];
+
+  console.log(`${logPrefix} Export performance summary`, {
+    wallClockMs: wallClock.totalMs,
+    phases: {
+      list: {
+        wallClockMs: wallClock.listMs,
+        bubbleRequests: summary.phases.list.requests,
+        bubbleApiDurationMs: summary.phases.list.apiDurationMs,
+        results: summary.phases.list.results,
+        errors: summary.phases.list.errors,
+      },
+      resolve: {
+        wallClockMs: wallClock.resolveMs,
+        bubbleRequests: resolvePhase.requests,
+        bubbleApiDurationMs: resolvePhase.apiDurationMs,
+        results: resolvePhase.results,
+        errors: resolvePhase.errors,
+        cacheHits: summary.cacheHits,
+        uniqueResolvedRefs: metrics.uniqueResolvedRefs ?? null,
+      },
+      csv: {
+        wallClockMs: wallClock.csvMs,
+        rows: wallClock.csvRows ?? null,
+        bytes: wallClock.csvBytes ?? null,
+      },
+    },
+    bubble: {
+      totalRequests: summary.total.requests,
+      totalApiDurationMs: summary.total.apiDurationMs,
+      totalResults: summary.total.results,
+      totalErrors: summary.total.errors,
+      byApiType: summary.byApiType,
+    },
+  });
+
+  if (Array.isArray(subrequestHistory) && subrequestHistory.length > 0) {
+    console.log(`${logPrefix} Subrequest detail (${subrequestHistory.length} Bubble API calls)`);
+    console.table(subrequestHistory);
+  }
 }
 
 app.get("/v1/health", (_req, res) => {
@@ -703,6 +854,18 @@ async function handleExport(req, res) {
   const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const logPrefix = `[csv-export][${requestId}]`;
   const subrequestHistory = [];
+  const wallClock = {
+    totalMs: 0,
+    listMs: 0,
+    resolveMs: 0,
+    csvMs: 0,
+    csvRows: null,
+    csvBytes: null,
+  };
+  const resolveContext = {
+    metrics: { cacheHits: 0 },
+    resolveCache: new Map(),
+  };
 
   try {
     console.log(`${logPrefix} Request started`, {
@@ -753,6 +916,7 @@ async function handleExport(req, res) {
       maxRecords: exportRequest.limit ?? null,
     });
 
+    const listFetchStartedAt = Date.now();
     const records = await fetchAllRecords({
       baseUrl,
       token,
@@ -760,23 +924,32 @@ async function handleExport(req, res) {
       constraints,
       maxRecords: exportRequest.limit,
       subrequestHistory,
+      historyContext: { step: "list", path: exportRequest.dataType },
     });
-    console.log(`${logPrefix} Bubble fetch complete`, { records: records.length });
+    wallClock.listMs = Date.now() - listFetchStartedAt;
+    console.log(`${logPrefix} Bubble fetch complete`, {
+      records: records.length,
+      durationMs: wallClock.listMs,
+    });
 
-    const resolveContext = {
+    Object.assign(resolveContext, {
       baseUrl,
       token,
       logPrefix,
-      resolveCache: new Map(),
       subrequestHistory,
-    };
+    });
+    const resolveStartedAt = Date.now();
     await applyResolvePlan(records, resolvePlan, resolveContext);
+    wallClock.resolveMs = Date.now() - resolveStartedAt;
     if (resolvePlan.length > 0) {
       console.log(`${logPrefix} Reference resolving complete`, {
         resolvedUniqueRefs: resolveContext.resolveCache.size,
+        cacheHits: resolveContext.metrics.cacheHits,
+        durationMs: wallClock.resolveMs,
       });
     }
 
+    const csvStartedAt = Date.now();
     const normalizedRows = records.map((record) =>
       mapRecordToCsvRow(record, exportRequest.columns, exportRequest.nullAs, exportRequest.timezone)
     );
@@ -788,10 +961,14 @@ async function handleExport(req, res) {
       exportRequest.encloseInQuotes,
       exportRequest.includeHeader
     );
+    wallClock.csvBytes = Buffer.byteLength(csv, "utf8");
+    wallClock.csvRows = normalizedRows.length;
+    wallClock.csvMs = Date.now() - csvStartedAt;
     console.log(`${logPrefix} CSV generated`, {
       rows: normalizedRows.length,
       columns: columns.length,
-      bytes: Buffer.byteLength(csv, "utf8"),
+      bytes: wallClock.csvBytes,
+      durationMs: wallClock.csvMs,
     });
     const safeFileName = exportRequest.fileName.replace(/[^\w.-]+/g, "_");
     const filename = safeFileName.endsWith(".csv") ? safeFileName : `${safeFileName}.csv`;
@@ -801,19 +978,27 @@ async function handleExport(req, res) {
       "Content-Disposition": `attachment; filename="${filename}"`,
       "Cache-Control": "no-store",
     });
+    wallClock.totalMs = Date.now() - startedAt;
     console.log(`${logPrefix} Response sent`, {
       status: 200,
-      durationMs: Date.now() - startedAt,
+      durationMs: wallClock.totalMs,
       filename,
     });
-    printSubrequestHistory(logPrefix, subrequestHistory);
+    printExportPerformanceSummary(logPrefix, subrequestHistory, wallClock, {
+      cacheHits: resolveContext.metrics.cacheHits,
+      uniqueResolvedRefs: resolveContext.resolveCache.size,
+    });
     return res.status(200).send(csv);
   } catch (error) {
+    wallClock.totalMs = Date.now() - startedAt;
     console.error(`${logPrefix} Export failed`, {
-      durationMs: Date.now() - startedAt,
+      durationMs: wallClock.totalMs,
       error: error.message,
     });
-    printSubrequestHistory(logPrefix, subrequestHistory);
+    printExportPerformanceSummary(logPrefix, subrequestHistory, wallClock, {
+      cacheHits: resolveContext.metrics.cacheHits,
+      uniqueResolvedRefs: resolveContext.resolveCache.size,
+    });
     return res.status(500).json({ error: `Export failed: ${error.message}` });
   }
 }
