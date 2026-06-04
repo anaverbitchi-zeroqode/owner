@@ -38,6 +38,7 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = Number.parseInt(process.env.PORT || "3000", 10);
 const PAGE_LIMIT = 100;
+const LIST_PAGE_CONCURRENCY = Number.parseInt(process.env.LIST_PAGE_CONCURRENCY || "20", 10);
 const RESOLVE_CHUNK_CONCURRENCY = Number.parseInt(
   process.env.RESOLVE_CHUNK_CONCURRENCY || "50",
   10
@@ -708,7 +709,37 @@ async function applyResolvePlan(records, resolvePlan, context) {
   }
 }
 
-async function fetchAllRecords({
+function trimResultsToMax(results, maxRecords, alreadyFetched) {
+  if (typeof maxRecords !== "number") return results;
+  const room = Math.max(0, maxRecords - alreadyFetched);
+  return results.slice(0, room);
+}
+
+function buildListPagePlan(firstResponse, firstResults, maxRecords) {
+  const pages = [];
+  let remaining = Number(firstResponse.remaining || 0);
+  let cursor =
+    typeof firstResponse.cursor === "number"
+      ? firstResponse.cursor + firstResults.length
+      : firstResults.length;
+  let fetched = firstResults.length;
+
+  while (remaining > 0) {
+    const limitLeft =
+      typeof maxRecords === "number" ? Math.max(0, maxRecords - fetched) : PAGE_LIMIT;
+    const requestLimit = Math.min(PAGE_LIMIT, limitLeft, remaining);
+    if (requestLimit <= 0) break;
+
+    pages.push({ cursor, limit: requestLimit });
+    cursor += requestLimit;
+    remaining -= requestLimit;
+    fetched += requestLimit;
+  }
+
+  return pages;
+}
+
+async function fetchAllRecordsSequential({
   baseUrl,
   token,
   dataType,
@@ -739,10 +770,7 @@ async function fetchAllRecords({
     });
 
     const results = response.results || [];
-    const acceptedResults =
-      typeof maxRecords === "number"
-        ? results.slice(0, Math.max(0, maxRecords - allResults.length))
-        : results;
+    const acceptedResults = trimResultsToMax(results, maxRecords, allResults.length);
     remaining = Number(response.remaining || 0);
     cursor =
       typeof response.cursor === "number" ? response.cursor + results.length : undefined;
@@ -751,6 +779,79 @@ async function fetchAllRecords({
   } while (remaining > 0 && (typeof maxRecords !== "number" || allResults.length < maxRecords));
 
   return allResults;
+}
+
+async function fetchAllRecordsParallel({
+  baseUrl,
+  token,
+  dataType,
+  constraints,
+  maxRecords,
+  subrequestHistory,
+  historyContext,
+}) {
+  const firstLimit =
+    typeof maxRecords === "number" ? Math.min(PAGE_LIMIT, Math.max(0, maxRecords)) : PAGE_LIMIT;
+  if (firstLimit <= 0) return [];
+
+  const firstResponse = await fetchPage({
+    baseUrl,
+    token,
+    dataType,
+    constraints,
+    cursor: undefined,
+    limit: firstLimit,
+    subrequestHistory,
+    historyContext,
+  });
+
+  const firstResults = trimResultsToMax(firstResponse.results || [], maxRecords, 0);
+  const remaining = Number(firstResponse.remaining || 0);
+  if (
+    remaining <= 0 ||
+    (typeof maxRecords === "number" && firstResults.length >= maxRecords)
+  ) {
+    return firstResults;
+  }
+
+  const pages = buildListPagePlan(firstResponse, firstResults, maxRecords);
+  if (pages.length === 0) return firstResults;
+
+  const basePath = historyContext?.path || dataType;
+  const pageResults = await runWithConcurrency(
+    pages,
+    LIST_PAGE_CONCURRENCY,
+    async (page, pageIndex) => {
+      let alreadyFetched = firstResults.length;
+      for (let i = 0; i < pageIndex; i += 1) {
+        alreadyFetched += pages[i].limit;
+      }
+
+      const response = await fetchPage({
+        baseUrl,
+        token,
+        dataType,
+        constraints,
+        cursor: page.cursor,
+        limit: page.limit,
+        subrequestHistory,
+        historyContext: {
+          step: historyContext?.step || "list",
+          path: `${basePath} [page ${pageIndex + 2}/${pages.length + 1}]`,
+        },
+      });
+      return trimResultsToMax(response.results || [], maxRecords, alreadyFetched);
+    }
+  );
+
+  return firstResults.concat(pageResults.flat());
+}
+
+async function fetchAllRecords(options) {
+  if (LIST_PAGE_CONCURRENCY <= 1) {
+    return fetchAllRecordsSequential(options);
+  }
+  return fetchAllRecordsParallel(options);
 }
 
 function createEmptyPhaseStats() {
@@ -914,6 +1015,7 @@ async function handleExport(req, res) {
       constraints: constraints.length,
       resolveRules: resolvePlan.length,
       maxRecords: exportRequest.limit ?? null,
+      listPageConcurrency: LIST_PAGE_CONCURRENCY,
     });
 
     const listFetchStartedAt = Date.now();
